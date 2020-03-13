@@ -11,9 +11,8 @@ START=90
 STOP=15
 
 NAME=shadowsocksr
-EXTRA_COMMANDS="rules watchdog"
+EXTRA_COMMANDS="rules"
 CONFIG_FILE=/var/etc/$NAME.json
-CRON_FILE=/etc/crontabs/root
 DNSMASQDIR=/var/dnsmasq.d
 WATCHDOG_ENDPOINT='accounts.gstatic.com'
 
@@ -207,7 +206,7 @@ start() {
 	ssr_local
 	ssr_tunnel
 	rm -f $CONFIG_FILE
-	valid_server $(uci_get_by_type transparent_proxy main_server) && add_cron
+	valid_server $(uci_get_by_type transparent_proxy main_server)
 }
 
 delay_start() {
@@ -233,74 +232,5 @@ stop() {
 	/usr/bin/ssr-rules -f
 	kill_all ssr-redir ssr-local ssr-tunnel
 	rm -f $DNSMASQDIR/ssr.conf $DNSMASQDIR/ssr-servers.conf 2>/dev/null
-	del_cron
 }
 
-add_cron() {
-	sed -i '/shadowsocksr_watchdog/d' $CRON_FILE
-	echo '0   */3   * * *  rm -f /var/log/shadowsocksr_watchdog.log 2>&1' >> $CRON_FILE
-	echo '*    *    * * * /etc/init.d/shadowsocksr watchdog >> /var/log/shadowsocksr_watchdog.log 2>&1' >> $CRON_FILE
-	/etc/init.d/cron restart
-}
-
-del_cron() {
-	sed -i '/shadowsocksr_watchdog/d' $CRON_FILE
-	/etc/init.d/cron restart
-}
-
-watchdog(){
-	command -v ssr-redir >/dev/null 2>&1 || return 1
-	local main_server=$(uci_get_by_type transparent_proxy main_server)
-	valid_server $main_server || return 1
-
-	cat_connect() {
-		target="$1"
-		retry=${2:-1}
-		timeout=5
-		[ $retry -lt 1 ] && return 1
-		ret_code=$(curl -s --connect-timeout $timeout "$target" -w %{http_code} -o /dev/null | tail -n1)
-		# echo -n "[ $retry $ret_code ] "
-		[ "x$ret_code" = "x200" -o "x$ret_code" = "x204" ] && return 0 || sleep 1 && cat_connect $target $((retry - 1))
-	}
-
-	LOGTIME=$(date "+%Y-%m-%d %H:%M:%S")
-	TRPORT=$(uci_get_by_type transparent_proxy local_port 1234)
-	GOOGLE=$(ping -4 -q -c 1 -s 0 -W 1 -w 1 ${WATCHDOG_ENDPOINT} 2>/dev/null | sed '1{s/[^(]*(//;s/).*//;q}')
-	DNSPOD=119.29.29.29 #DNSPOD HTTPDNS (Inside GFW)
-
-	if [ "Z$GOOGLE" = "Z" ]; then
-		iptables -t nat -I OUTPUT -p tcp -d $DNSPOD -j RETURN
-		cat_connect "http://${DNSPOD}/d?dn=qq.com"
-		if [ "Z$?" = "Z0" ]; then
-			echo "[${LOGTIME}] Problem-DNS decteted, restarting ${NAME}..."
-			[ -x /etc/init.d/dnsmasq-extra ] && /etc/init.d/dnsmasq-extra restart || /etc/init.d/dnsmasq restart
-			stop  >/dev/null 2>&1
-			start >/dev/null 2>&1
-		else
-			echo '['$LOGTIME'] Network Problem. Do nothing.'
-		fi
-		iptables -t nat -D OUTPUT -p tcp -d $DNSPOD -j RETURN
-		return 0
-	fi
-
-	iptables -t nat -I OUTPUT -p tcp -d $GOOGLE -j REDIRECT --to-port $TRPORT
-	iptables -t nat -I OUTPUT -p tcp -d $DNSPOD -j RETURN
-	cat_connect "http://${GOOGLE}/generate_204" 3
-	if [ "Z$?" = "Z0" ]; then
-		echo "[${LOGTIME}] ${NAME} No Problem."
-	else
-		cat_connect "http://${DNSPOD}/d?dn=qq.com"
-		if [ "Z$?" = "Z0" ]; then
-			echo "[${LOGTIME}] Problem decteted, restarting ${NAME}..."
-			[ -x /etc/init.d/haproxy-tcp ] && /etc/init.d/haproxy-tcp restart
-			stop  >/dev/null 2>&1
-			start >/dev/null 2>&1
-		else
-			echo '['$LOGTIME'] Network Problem. Do nothing.'
-		fi
-	fi
-
-	iptables -t nat -D OUTPUT -p tcp -d $GOOGLE -j REDIRECT --to-port $TRPORT
-	iptables -t nat -D OUTPUT -p tcp -d $DNSPOD -j RETURN
-	return 0
-}
